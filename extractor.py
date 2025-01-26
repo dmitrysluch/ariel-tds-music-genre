@@ -390,7 +390,6 @@ class AudioDataExtractionPipeline(metaclass=AudioDataExtractionPipelineMeta):
         combined = []
         for sample in range(len(self.features[feature_names[0]])):
             flattened = []
-            # Python 3.7 and later: Dictionary order is guaranteed to be insertion order
             for feat_name in feature_names:
                 flattened.append(self.features[feat_name][sample].reshape(-1))
             combined.append(np.hstack(flattened))

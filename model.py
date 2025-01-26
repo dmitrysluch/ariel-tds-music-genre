@@ -73,7 +73,15 @@ def predict_catboost(model, idx: np.array, X: np.array, y: Optional[np.array] = 
     return aggregated_idx, aggregated_preds, aggregated_labels
 
 
-def train_and_evaluate_catboost(idx_eval: np.ndarray, X_train: np.ndarray, X_eval: np.ndarray, y_train: np.ndarray, y_eval: np.ndarray, bagging_temperature=1) -> None:
+def train_and_evaluate_catboost(
+    idx_eval: np.ndarray, 
+    X_train: np.ndarray, 
+    X_eval: np.ndarray, 
+    y_train: np.ndarray, 
+    y_eval: np.ndarray, 
+    bagging_temperature=1, 
+    feature_weights=None
+) -> None:
     """
     Train and evaluate a CatBoost multiclass classifier.
     
@@ -96,7 +104,8 @@ def train_and_evaluate_catboost(idx_eval: np.ndarray, X_train: np.ndarray, X_eva
         eval_metric='Accuracy',  # Metric for evaluation
         verbose=50,              # Real-time output every 50 iterations
         random_seed=42,           # For reproducibility
-        bagging_temperature=bagging_temperature
+        bagging_temperature=bagging_temperature,
+        feature_weights=feature_weights
     )
     
     # Train the model
