@@ -390,6 +390,7 @@ class AudioDataExtractionPipeline(metaclass=AudioDataExtractionPipelineMeta):
         combined = []
         for sample in range(len(self.features[feature_names[0]])):
             flattened = []
+            # Python 3.7 and later: Dictionary order is guaranteed to be insertion order
             for feat_name in feature_names:
                 flattened.append(self.features[feat_name][sample].reshape(-1))
             combined.append(np.hstack(flattened))
@@ -397,3 +398,10 @@ class AudioDataExtractionPipeline(metaclass=AudioDataExtractionPipelineMeta):
         if not combined:
             return np.array([])  # In case there's nothing at all
         return np.stack(combined, axis=0)
+
+    def get_feature_names_vector(self, feature_names):
+        flattened = []
+        for feat_name in feature_names:
+            shape = self.features[feat_name][0].shape
+            flattened.extend([f'{feat_name}_{",".join(map(str, i))}' for i in np.ndindex(shape)])
+        return np.array(flattened)
