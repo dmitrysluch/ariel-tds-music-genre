@@ -169,3 +169,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+catboost_info/
+dataset/
+# Old dirty version of notebook
+genre_detection.ipynb
