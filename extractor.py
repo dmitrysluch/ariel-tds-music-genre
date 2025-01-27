@@ -122,27 +122,21 @@ class AudioDataExtractionPipeline(metaclass=AudioDataExtractionPipelineMeta):
         cls._stateless_deps[feature_name] = cls._get_dependencies_from_signature(method, ignore=('state',))
 
     @classmethod
-    def register_stateful_extractor(cls, feature_name, method, shuffle=False, map_labels=None):
+    def register_sklearn_extractor(cls, feature_name, deps, transformer, shuffle=False, map_labels=None):
         """
-        Register a stateful extractor.
+        Register a stateless extractor.
 
-        If self.train == True, we assume the method has signature:
-            def method(state, **dependency_features) -> (extracted, new_state)
-        If self.train == False, we assume the method has signature:
-            def method(**dependency_features, state) -> extracted
-
-        The method's other parameters (besides 'state') are the dependencies.
+        The method's keyword parameters (minus 'state') are used as the
+        dependencies (names of features it needs).
         
         :param feature_name: Name of the feature this extractor will compute.
-        :param method: Callable implementing the required stateful logic.
+        :param method: A callable that receives samples one by one with signature:
+                       def method(**dependency_features) -> np.ndarray or List[np.ndarray].
+                       The pipeline will call this once per sample, passing the necessary
+                       dependency features.
         """
-        cls._stateful_extractors[feature_name] = (method, shuffle, [] if map_labels is None else map_labels)
-        deps = cls._get_dependencies_from_signature(method, ignore=('state',))
+        cls._stateful_extractors[feature_name] = (transformer, shuffle, [] if map_labels is None else map_labels)
         cls._stateful_deps[feature_name] = deps
-
-        # Initialize the extractor's state if not present
-        if feature_name not in cls._stateful_states:
-            cls._stateful_states[feature_name] = None
 
     def get_state(self):
         """
@@ -324,47 +318,20 @@ class AudioDataExtractionPipeline(metaclass=AudioDataExtractionPipelineMeta):
 
         # Number of samples is inferred from one of its dependencies (if any exist)
         if len(deps) == 0:
-            if map_labels:
-                raise ValueError("Cannot bind labels to generator")
-            # No dependencies => single call
-            if self.train:
-                out, new_state = extractor(state=self._stateful_states[feat_name])
-                self._stateful_states[feat_name] = new_state
-                if isinstance(out, list):
-                    self.features[feat_name].extend(out)
-                else:
-                    self.features[feat_name].append(out)
-            else:
-                out = extractor(state=self._stateful_states[feat_name])
-                if isinstance(out, list):
-                    self.features[feat_name].extend(out)
-                else:
-                    self.features[feat_name].append(out)
-            return
+            raise ValueError("You must specify at least one dependancy")
 
         num_samples = len(self.features[deps[0]])
-        for i in tqdm(range(num_samples), desc=feat_name):
-            # Gather the i-th sample of each dependency
-            kw = {}
-            for d in deps:
-                kw[d] = self.features[d][i]
 
-            if self.train:
-                new_state, out = extractor(state=self._stateful_states[feat_name], **kw)
-                self._stateful_states[feat_name] = new_state
-            else:
-                out = extractor(state=self._stateful_states[feat_name], **kw)
+        X = self.get_features(deps)
+        if self.train:
+            out = extractor.fit_transform(X)
+        else:
+            out = extractor.transform(X)
 
-            # out can be a single np.array or a list of np.array
-            if isinstance(out, list):
-                self.features[feat_name].extend(out)
-                for l_from, l_to in map_labels:
-                    self.features[l_to].extend([self.features[l_from][i]] * len(out))
-            else:
-                self.features[feat_name].append(out)
-                for l_from, l_to in map_labels:
-                    self.features[l_to].append(self.features[l_from][i])
-
+        self.features[feat_name] = list(out)
+        
+        for l_from, l_to in map_labels:
+            self.features[l_to].extend([self.features[l_from][i]] * len(out))
         if shuffle:
             order = list(range(len(self.features[feat_name])))
             self.rnd.shuffle(order)
