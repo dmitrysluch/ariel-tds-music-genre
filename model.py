@@ -123,3 +123,54 @@ def train_and_evaluate_catboost(
     print(f"Evaluation Accuracy: {eval_accuracy:.4f}")
     
     return model, eval_accuracy
+
+
+def select_features_catboost(
+    X_train: np.ndarray, 
+    X_eval: np.ndarray, 
+    y_train: np.ndarray, 
+    y_eval: np.ndarray, 
+) -> None:
+    """
+    Train and evaluate a CatBoost multiclass classifier.
+    
+    Parameters:
+    - X_train: numpy array of training features
+    - X_eval: numpy array of evaluation features
+    - y_train: numpy array of training labels
+    - y_eval: numpy array of evaluation labels
+    
+    Returns:
+    - model: Trained CatBoostClassifier model
+    - eval_accuracy: Evaluation accuracy on the validation set
+    """
+    # Initialize CatBoostClassifier
+    model = CatBoostClassifier(
+        iterations=500,          # Number of boosting iterations
+        learning_rate=0.1,       # Learning rate
+        depth=3,                 # Depth of the tree
+        loss_function='MultiClass',  # Multiclass classification
+        eval_metric='Accuracy',  # Metric for evaluation
+        verbose=100,              # Real-time output every 50 iterations
+        random_seed=42,           # For reproducibility
+    )
+    
+    # # Train the model
+    # model.fit(
+    #     X_train, y_train,
+    #     eval_set=(X_eval, y_eval),
+    #     use_best_model=True,  # Use the best iteration during training
+    #     plot=True             # Show training progress plot (if supported)
+    # )
+
+    model.select_features(
+        X_train, y_train,
+        eval_set=(X_eval, y_eval),
+        features_for_select=f'0-{X_train.shape[1]-1}',
+        num_features_to_select=250,
+        algorithm='RecursiveByShapValues',
+        steps=10,
+        shap_calc_type='Regular',
+        train_final_model=True
+    )
+    return model
