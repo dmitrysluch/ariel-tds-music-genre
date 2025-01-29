@@ -80,7 +80,8 @@ def train_and_evaluate_catboost(
     y_train: np.ndarray, 
     y_eval: np.ndarray, 
     bagging_temperature=1, 
-    feature_weights=None
+    feature_weights=None,
+    cat_features = None
 ) -> None:
     """
     Train and evaluate a CatBoost multiclass classifier.
@@ -105,7 +106,9 @@ def train_and_evaluate_catboost(
         verbose=50,              # Real-time output every 50 iterations
         random_seed=42,           # For reproducibility
         bagging_temperature=bagging_temperature,
-        feature_weights=feature_weights
+        feature_weights=feature_weights,
+        cat_features=cat_features,
+        one_hot_max_size=20
     )
     
     # Train the model
