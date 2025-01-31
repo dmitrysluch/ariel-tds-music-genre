@@ -73,59 +73,96 @@ def predict_catboost(model, idx: np.array, X: np.array, y: Optional[np.array] = 
     return aggregated_idx, aggregated_preds, aggregated_labels
 
 
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, classification_report
+from catboost import CatBoostClassifier
+
 def train_and_evaluate_catboost(
-    idx_eval: np.ndarray, 
-    X_train: np.ndarray, 
-    X_eval: np.ndarray, 
-    y_train: np.ndarray, 
-    y_eval: np.ndarray, 
-    bagging_temperature=1, 
+    X: np.ndarray,
+    y: np.ndarray,
+    bagging_temperature=1,
     feature_weights=None,
-    cat_features = None
-) -> None:
+    cat_features=None
+):
     """
-    Train and evaluate a CatBoost multiclass classifier.
+    Train and evaluate a CatBoost multiclass classifier using 5-fold cross-validation.
     
     Parameters:
-    - X_train: numpy array of training features
-    - X_eval: numpy array of evaluation features
-    - y_train: numpy array of training labels
-    - y_eval: numpy array of evaluation labels
+    - X: numpy array of features
+    - y: numpy array of labels
     
     Returns:
-    - model: Trained CatBoostClassifier model
-    - eval_accuracy: Evaluation accuracy on the validation set
+    - final_model: Trained CatBoostClassifier model on the entire dataset
+    - mean_accuracy: Mean accuracy across the 5 folds
     """
-    # Initialize CatBoostClassifier
-    model = CatBoostClassifier(
-        iterations=500,          # Number of boosting iterations
-        learning_rate=0.1,       # Learning rate
-        depth=3,                 # Depth of the tree
-        loss_function='MultiClass',  # Multiclass classification
-        eval_metric='Accuracy',  # Metric for evaluation
-        verbose=50,              # Real-time output every 50 iterations
-        random_seed=42,           # For reproducibility
+
+    # Set up stratified 5-fold cross-validation
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    fold_accuracies = []
+    all_y_true = []
+    all_y_pred = []
+
+    # Perform cross-validation
+    for train_idx, valid_idx in skf.split(X, y):
+        X_train, X_valid = X[train_idx], X[valid_idx]
+        y_train, y_valid = y[train_idx], y[valid_idx]
+
+        # Initialize CatBoostClassifier
+        model = CatBoostClassifier(
+            iterations=500,          
+            learning_rate=0.1,       
+            depth=3,                 
+            loss_function='MultiClass',  
+            eval_metric='Accuracy',  
+            verbose=100,  # Set verbose=True or a numeric value if you want progress logs
+            random_seed=42,          
+            bagging_temperature=bagging_temperature,
+            feature_weights=feature_weights,
+            cat_features=cat_features,
+            one_hot_max_size=20
+        )
+        
+        # Train on the fold
+        model.fit(X_train, y_train)
+        
+        # Predict on the validation fold
+        y_pred_fold = model.predict(X_valid)
+
+        # Calculate accuracy for this fold
+        fold_accuracy = accuracy_score(y_valid, y_pred_fold)
+        fold_accuracies.append(fold_accuracy)
+
+        # Collect predictions and true labels for a consolidated report
+        all_y_pred.extend(y_pred_fold)
+        all_y_true.extend(y_valid)
+
+    # Compute overall metrics
+    mean_accuracy = np.mean(fold_accuracies)
+    print(f"Mean Accuracy across 5 folds: {mean_accuracy:.4f}")
+    print("\nClassification Report (aggregated across folds):")
+    print(classification_report(all_y_true, all_y_pred))
+
+    # (Optional) Train a final model on the entire dataset
+    # so you have a ready-to-use classifier after cross-validation
+    final_model = CatBoostClassifier(
+        iterations=500,          
+        learning_rate=0.1,       
+        depth=3,                 
+        loss_function='MultiClass',  
+        eval_metric='Accuracy',  
+        verbose=100,
+        random_seed=42,
         bagging_temperature=bagging_temperature,
         feature_weights=feature_weights,
         cat_features=cat_features,
         one_hot_max_size=20
     )
-    
-    # Train the model
-    model.fit(
-        X_train, y_train,
-        eval_set=(X_eval, y_eval),
-        use_best_model=True,  # Use the best iteration during training
-        plot=True             # Show training progress plot (if supported)
-    )
-    
-    # Evaluate the model
-    _, y_pred, y_true = predict_catboost(model, idx_eval, X_eval, y_eval)
-    eval_accuracy = accuracy_score(y_true, y_pred)
-    print("\nClassification Report:\n", classification_report(y_true, y_pred))
-    print(f"Evaluation Accuracy: {eval_accuracy:.4f}")
-    
-    return model, eval_accuracy
+    final_model.fit(X, y)
+
+    return final_model, mean_accuracy
+
 
 
 def select_features_catboost(
