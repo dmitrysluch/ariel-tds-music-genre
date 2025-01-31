@@ -1,5 +1,5 @@
 from catboost import CatBoostClassifier
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.metrics import classification_report, accuracy_score, balanced_accuracy_score
 import numpy as np
 from typing import Optional, Tuple
 from collections import Counter
