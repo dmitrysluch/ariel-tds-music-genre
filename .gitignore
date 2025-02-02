@@ -175,3 +175,5 @@ dataset/
 # Old dirty version of notebook
 genre_detection.ipynb
 Untitled.ipynb
+
+.dagxtractor
