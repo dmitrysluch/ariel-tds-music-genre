@@ -1,30 +1,15 @@
 import inspect
 import numpy as np
+import numba as nb
 import pandas as pd
 import os
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import (
     Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, Type, TypeVar
 )
-
-
-def is_jupyter():
-    try:
-        shell = get_ipython().__class__.__name__
-        if shell == 'ZMQInteractiveShell':
-            return True
-        else:
-            return False
-    except NameError:
-        return False
-
-
-if is_jupyter():
-    from tqdm.notebook import tqdm
-else:
-    from tqdm import tqdm
 
 # ------------------------------------------------------------------
 #  LazyFeature: holds data in memory or a path on disk
@@ -75,16 +60,6 @@ class LazyFeature:
         but we now consider it out of date if data changed. (For simplicity, we won't re-dump automatically.)
         """
         self._data = data
-
-    def size(self) -> int:
-        """Return number of samples (rows) if known, else 0."""
-        d = self._data
-        if d is None:
-            # Must load to count
-            d = self.get()
-        if isinstance(d, np.ndarray):
-            return d.shape[0]
-        return len(d)
 
 
 # ------------------------------------------------------------------
@@ -188,9 +163,21 @@ def flat_mapper(
     return decorator
 
 # ------------------------------------------------------------------
-#  Metaclass for DAGXtractor
+#  Table class
 # ------------------------------------------------------------------
 
+
+@dataclass(init=False, frozen=True)
+class Table:
+    id: uuid.UUID
+    parent_index_mapping: Optional[str]
+    def __init__(self, parent_index_mapping=None):
+        self.parent_index_mapping = parent_index_mapping
+        self.id = uuid.uuid4()
+
+# ------------------------------------------------------------------
+#  Metaclass for DAGXtractor
+# ------------------------------------------------------------------
 
 class DAGXtractorMeta(type):
     """
@@ -202,8 +189,8 @@ class DAGXtractorMeta(type):
         dct = {k: v for k, v in dct.items() if not isinstance(v, Extractor)}
         cls = super().__new__(mcs, name, bases, dct)
         # Initialize or reset class-level dicts
-        cls._extractors: Dict[str, Extractor] = {}
-        cls._extractors_for_feature: Dict[str, Extractor] = {}
+        cls._extractors = {}
+        cls._extractors_for_feature = {}
         for ext in extractors:
             cls._store_extractor(ext)
         return cls
@@ -228,7 +215,7 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
         self._batch_size = batch_size
         # features & indexes are instance-level
         self.features: Dict[str, LazyFeature] = {}
-        self.indexes: Dict[str, np.ndarray] = {}
+        self.tables: Dict[str, Table] = {}
         if path is None:
             path = os.path.join(".dagxtractor", uuid.uuid4().hex)
         self._path = path
@@ -360,7 +347,7 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
         for feat in list(self.features.keys()):
             if feat in type(self)._extractors_for_feature:
                 del self.features[feat]
-                del self.indexes[feat]
+                del self.tables[feat]
         self.soft_extract()
 
     def soft_extract(self) -> None:
@@ -438,7 +425,7 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
         If multi-output, that single call fills all outputs for the extractor.
         """
         # Already computed? skip. It might be an extractor returning several features
-        if self._has_nonempty_data(feat_name):
+        if feat_name in self.features:
             return
         # If no extractor, we do nothing (it's presumably an initial feature or truly absent)
         if feat_name not in type(self)._extractors_for_feature:
@@ -446,41 +433,132 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
 
         ext = type(self)._extractors_for_feature[feat_name]
 
-        # Check index references among dependencies
-        dep_indexes = [self.indexes[d] for d in ext.deps]
-        base_idx = dep_indexes[0]
-        for idx in dep_indexes[1:]:
-            if idx is not base_idx:
+        # Check table references among dependencies
+        dep_tables = [self.tables[d] for d in ext.deps]
+        base_table = dep_tables[0]
+        for idx in dep_tables[1:]:
+            if idx != base_table:
                 raise ValueError(
-                    f"Dependencies of '{feat_name}' must share the same index reference. "
-                    f"Mismatch between '{ext.deps[0]}' and another dependency."
+                    f"Dependencies of '{feat_name}' must share the same table."
+                    f"Use join, to join features from different tables"
                 )
 
-        # Actually run the extractor
-        outputs = self._run_extractor(ext)
+        outputs, table = self._run_extractor(ext)
+        # There will be features and possibly newly created parent mappings.
+        for k, v in outputs.items(): 
+            self.features[k] = v
+            self.tables[k] = table
 
-        # If single-output, store under ext.feature_names[0]
-        if not ext.multi_output:
-            out_feat = ext.feature_names[0]
-            self._assign_extracted(out_feat, outputs, ext)
-        else:
-            # Multi-output => 'outputs' must be dict
-            if not isinstance(outputs, dict):
-                raise ValueError(
-                    f"Extractor for {ext.feature_names} is multi_output, but returned {type(outputs)}.")
-            for fkey in ext.feature_names:
-                val = outputs.get(fkey)
-                if val is None:
+    @staticmethod
+    def create_vectorized_mapper(ext: Extractor, dependencies: list[Any]):
+        """
+        Creates a function that maps `ext.method` along axis=0 of the given dependencies.
+        """
+
+        def is_numba_compatible(dep: np.ndarray | list):
+            """
+            You can adapt this checker as you see fit:
+            - For instance, if dep is a list of objects or an ndarray with dtype=object,
+              we consider it "non-numba-compatible".
+            """
+            return isinstance(dep, np.ndarray) and dep.dtype != object
+
+        must_plain_loop = (not ext.uniform) or any(
+            not is_numba_compatible(dep) for dep in dependencies)
+
+        def plain_python_wrapper():
+            """
+            Applies 'method' sample-by-sample in pure Python, returning either
+            a list of results or a dict of lists of results (if multi_output).
+            """
+            n = len(dependencies[0])
+
+            if ext.multi_output:
+                first_out = ext.method(*_build_sample_args(0))
+                if not isinstance(first_out, dict):
                     raise ValueError(
-                        f"Expected multi-output dict to have key '{fkey}'. Missing.")
-                self._assign_extracted(fkey, val, ext)
+                        "method is expected to return a dict when multi_output=True")
+                out_dict = {
+                    k: np.empty((n,) + first_out.shape) if ext.uniform else [None] * n for k in first_out.keys()
+                }
+                for i in range(1, n):
+                    result = ext.method(*_build_sample_args(i))
+                    for k in result.keys():
+                        out_dict[k][i] = result[k]
+                return out_dict
+            else:
+                # Single output
+                first_out = ext.method(*_build_sample_args(0))
+                results = [first_out]
+                for i in range(1, n):
+                    results.append(ext.method(*_build_sample_args(i)))
+                return results
 
-    def _run_extractor(self, ext: Extractor) -> Any:
-        """
-        Actually invoke the user method. In batch mode, we pass arrays/lists in mini-batches;
-        otherwise, we loop over individual samples. We apply optional shuffling if requested.
+        def _build_sample_args(i):
+            """
+            Build the list of arguments for method(...), taking the i-th sample (axis=0).
+            """
+            return [dep[i] for dep in dependencies]
 
+        if must_plain_loop:
+            return plain_python_wrapper
+        return nb.jit(nopython=True)(plain_python_wrapper)
+
+    @staticmethod
+    def create_vectorized_flat_mapper(ext: Extractor, dependencies: list[Any]):
         """
+        Creates a function that flap maps `ext.method` along axis=0 of the given dependencies.
+        """
+
+        def plain_python_wrapper():
+            """
+            Applies 'method' sample-by-sample in pure Python, returning either
+            a list of results or a dict of lists of results (if multi_output).
+            """
+            n = len(dependencies[0])
+            index = []
+            curr_index = 0
+            if ext.multi_output:
+                first_out = ext.method(*_build_sample_args(0))
+                if not isinstance(first_out, dict):
+                    raise ValueError(
+                        "method is expected to return a dict when multi_output=True")
+                out_dict = {k: [] for k in first_out.keys()}
+                for i in range(1, n):
+                    result = ext.method(*_build_sample_args(i))
+                    for k in result.keys():
+                        out_dict[k].append(result[k])
+                curr_index += out_dict[iter(next(out_dict.keys()))].shape[0]
+                index.append(curr_index)
+                for k in result.keys():
+                    if ext.uniform:
+                        out_dict[k] = np.stack(out_dict[k], axis=0)
+                    else:
+                        out_dict[k] = sum(out_dict[k])
+                return out_dict
+            else:
+                # Single output
+                first_out = ext.method(*_build_sample_args(0))
+                results = [first_out]
+                for i in range(1, n):
+                    results.append(ext.method(*_build_sample_args(i)))
+                    curr_index += results[-1].shape[0]
+                    index.append(curr_index)
+                if ext.uniform:
+                    results = np.stack(results, axis=0)
+                else:
+                    results = sum(results)
+                return results
+
+        def _build_sample_args(i):
+            """
+            Build the list of arguments for method(...), taking the i-th sample (axis=0).
+            """
+            return [dep[i] for dep in dependencies]
+
+        return plain_python_wrapper
+
+    def _run_extractor(self, ext: Extractor) -> tuple[dict[str, Any], Table]:
         # Load dependency data
         dep_data = []
         for d in ext.deps:
@@ -489,320 +567,79 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
                     f"Dependency '{d}' not found in self.features.")
             dep_data.append(self.features[d].get())
 
-        base_idx = self.indexes[ext.deps[0]]
-
-        # Initialize combined_results container
-        if ext.multi_output:
-            # dict {feature_name: [outputs...]}
-            combined_results: Any = defaultdict(list)
+        if ext.type == ExtractorType.BATCH_MAPPER or ext.type == ExtractorType.BATCH_FLAT_MAPPER:
+            batched_method = ext.method
+        elif ext.type == ExtractorType.MAPPER:
+            batched_method = self.create_vectorized_mapper(
+                ext, dep_data)
+        elif ext.type == ExtractorType.FLAT_MAPPER:
+            batched_method = self.create_vectorized_flat_mapper(
+                ext, dep_data)
         else:
-            combined_results = []  # single list of outputs
+            raise NotImplementedError()
 
-        # ---------------------------
-        # Batch mode
-        # ---------------------------
-        if ext.type in (ExtractorType.BATCH_MAPPER, ExtractorType.BATCH_FLAT_MAPPER):
-            # Number of mini-batches (progress bar)
-            num_batches = (len(base_idx) + self._batch_size -
-                           1) // self._batch_size
-            # Split each dependency's data into mini-batches
-            splitted_deps = []
-            for dd in dep_data:
-                # For arrays, np.array_split works; if dd is a list, wrap in np.array first
-                arr = dd if isinstance(
-                    dd, np.ndarray) else np.array(dd, dtype=object)
-                splitted_deps.append(np.array_split(arr, num_batches))
+        try:
+            result = batched_method(*dep_data)
+        except Exception as e:
+            raise RuntimeError(
+                f"Extractor '{ext.feature_names}' failed."
+            ) from e
 
-            for mini_batch_idx, batch_tuple in enumerate(tqdm(zip(*splitted_deps), total=num_batches, desc=ext.feature_names[0])):
-                # batch_tuple is a tuple of mini-batch arrays, one per dependency
-                try:
-                    r = ext.method(*batch_tuple)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Extractor method failed on mini-batch {mini_batch_idx} "
-                        f"for extractor '{ext.feature_names}'."
-                    ) from e
+        if ext.type == ExtractorType.FLAT_MAPPER or ext.type == ExtractorType.BATCH_FLAT_MAPPER:
+            result, index_borders = result
+            index = np.zeros((index_borders[-1],))
+            index[index_borders[:-1]] = 1
+            index = np.cumsum(index)
 
-                # Distinguish multi-output vs. single-output
-                if ext.multi_output:
-                    # Must be a dict of arrays
-                    if not isinstance(r, dict):
-                        raise TypeError(
-                            f"Multi-output batch extractor must return a dict, got {type(r)} instead."
-                        )
-                    for k, v in r.items():
-                        if not isinstance(v, np.ndarray):
-                            raise TypeError(
-                                f"Multi-output batch must return np.ndarray for key '{k}', got {type(v)}."
-                            )
-                        # BATCH_MAPPER => shape[0] should match batch size
-                        if ext.type == ExtractorType.BATCH_MAPPER:
-                            # first dep batch size
-                            expected_sz = batch_tuple[0].shape[0]
-                            if v.shape[0] != expected_sz:
-                                raise ValueError(
-                                    f"Expected output array for '{k}' to have shape[0] == {expected_sz}, "
-                                    f"got {v.shape[0]}."
-                                )
-                        # Accumulate
-                        combined_results[k].append(v)
-                else:
-                    # Single-output => r should be an array
-                    if not isinstance(r, np.ndarray):
-                        raise TypeError(
-                            f"Batch (single-output) extractor must return an np.ndarray, got {type(r)}."
-                        )
-                    if ext.type == ExtractorType.BATCH_MAPPER:
-                        # shape[0] must match batch size
-                        expected_sz = batch_tuple[0].shape[0]
-                        if r.shape[0] != expected_sz:
-                            raise ValueError(
-                                f"BATCH_MAPPER output shape[0] must be {expected_sz}, got {r.shape[0]}."
-                            )
-                    # Accumulate
-                    combined_results.append(r)
-
-        # ---------------------------
-        # Per-sample mode
-        # ---------------------------
-        else:
-            n = len(base_idx)
-            for i in tqdm(range(n), total=n, desc=ext.feature_names[0]):
-                # Build arguments for the i-th sample
-                sample_args = []
-                for dd in dep_data:
-                    sample_args.append(dd[i])
-
-                try:
-                    r = ext.method(*sample_args)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Extractor method failed on sample index {i} for '{ext.feature_names}'."
-                    ) from e
-
-                if ext.multi_output:
-                    if not isinstance(r, dict):
-                        raise TypeError(
-                            f"Multi-output (per-sample) must return a dict, got {type(r)}."
-                        )
-                    for k, v in r.items():
-                        if ext.type == ExtractorType.FLAT_MAPPER and ext.uniform:
-                            if not isinstance(v, np.ndarray):
-                                raise TypeError(
-                                    f"Uniform flat mapper must return np.ndarray for key '{k}', got {type(v)}."
-                                )
-                        elif ext.type == ExtractorType.FLAT_MAPPER and not ext.uniform:
-                            # non-uniform => convert to list
-                            v = list(v)
-                        combined_results[k].append(v)
-                else:
-                    if ext.type == ExtractorType.FLAT_MAPPER:
-                        if ext.uniform:
-                            if not isinstance(r, np.ndarray):
-                                raise TypeError(
-                                    f"Uniform flat mapper must return np.ndarray, got {type(r)}."
-                                )
-                        else:
-                            r = list(r)
-                    combined_results.append(r)
-
-        # ---------------------------
-        # Combine results
-        # ---------------------------
-        def _fast_concat(arrays):
-            shape = (sum(array.shape[0] for array in arrays),) + arrays[0].shape[1:]
-            res = np.empty(shape, dtype=arrays[0].dtype)
-            start = 0
-            for array in arrays:
-                res[start : start + array.shape[0]] = array
-                start += array.shape[0]
-            return res
-
-        def _combine_results(results: Any) -> Any:
-            """
-            Combine lists of arrays (or arrays) into final shape,
-            depending on uniform vs. non-uniform and mapper type.
-            """
-            if ext.type in (ExtractorType.BATCH_MAPPER, ExtractorType.BATCH_FLAT_MAPPER):
-                # We have a list of arrays -> stack along axis=0
-                try:
-                    return _fast_concat(results)
-                except ValueError as e:
-                    raise ValueError(
-                        f"Could not concatenate batch results for '{ext.feature_names}'. "
-                        f"Ensure consistent shapes. Error: {e}"
-                    ) from e
-
-            if ext.type == ExtractorType.FLAT_MAPPER and ext.uniform:
-                # We have a list of arrays (one per sample) -> stack
-                try:
-                    return _fast_concat(results)
-                except ValueError as e:
-                    raise ValueError(
-                        f"Could not concatenate uniform flat mapper results for '{ext.feature_names}'. "
-                        f"Check shape consistency. Error: {e}"
-                    ) from e
-
-            if ext.type == ExtractorType.MAPPER:
-                if ext.uniform:
-                    # Uniform single-sample -> stack adding an axis
-                    try:
-                        if results and isinstance(results[0], np.ndarray):
-                            shape = results[0].shape
-                            # Concatenate is much faster.
-                            return _fast_concat(results).reshape(-1, *shape)
-                        else:
-                            return np.array(results)
-                    except ValueError as e:
-                        raise ValueError(
-                            f"Could not convert results to np.array for '{ext.feature_names}'. "
-                            f"Inconsistent shapes? Error: {e}"
-                        ) from e
-                else:
-                    # non-uniform MAPPER => keep as list
-                    return results
-
-            # non-uniform FLAT_MAPPER => sum of lists
-            try:
-                return sum(results, [])
-            except TypeError as e:
-                raise TypeError(
-                    f"Non-uniform flat mapper expects a list of lists, but got something else. "
-                    f"Cannot flatten results for '{ext.feature_names}'. Error: {e}"
-                ) from e
-
-        if ext.multi_output:
-            if not isinstance(combined_results, dict):
-                raise TypeError(
-                    f"Internal error: multi_output was True but combined_results is {type(combined_results)}."
-                )
-            final = {}
-            for k, v in combined_results.items():
-                try:
-                    final[k] = _combine_results(v)
-                except Exception as e:
-                    raise ValueError(
-                        f"Failed to combine multi-output results for key '{k}' "
-                        f"in extractor '{ext.feature_names}'."
-                    ) from e
-            combined_results = final
-        else:
-            try:
-                combined_results = _combine_results(combined_results)
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to combine results for single-output extractor '{ext.feature_names}'."
-                ) from e
-
-        # Shuffle if needed
+        if not ext.multi_output:
+            result = {
+                ext.feature_names[0]: result
+            }
+        
+        index_column_name = f"__index_{ext.feature_names[0]}"
+        if ext.type == ExtractorType.FLAT_MAPPER or ext.type == ExtractorType.BATCH_FLAT_MAPPER:
+            result[index_column_name] = index
+        
         if ext.shuffle:
-            return self._shuffle_result(combined_results)
-        return combined_results
+            if index_column_name not in result:
+                result[index_column_name] = np.arange(len(result[next(iter(result.keys()))]))
+            rng = np.random.default_rng(seed = self._seed ^ hash(ext.feature_names[0]))
+            self._shuffle_result(result, rng)
+        table = self.tables[ext.deps[0]] if index_column_name not in result else Table(index_column_name)
+        return result, table
 
     @staticmethod
-    def _shuffle_result(result: dict | list | np.ndarray, rng: np.random.Generator) -> dict | list | np.ndarray:
-        """
-        Shuffle the result. Might be a single array/list or a dict of arrays/lists.
-        """
-        if isinstance(result, dict):
-            # multi-output => each key is an array or list
-            # All must be same length
-            first_key = next(iter(result))
-            first_val = result[first_key]
-            length = len(first_val) if isinstance(
-                first_val, list) else first_val.shape[0]
-            perm = rng.permutation(length)
+    def _shuffle_result(result: dict[str, Union[list, np.ndarray]], rng: np.random.Generator) -> dict | list | np.ndarray:
+        first_key = next(iter(result))
+        first_val = result[first_key]
+        length = len(first_val) if isinstance(
+            first_val, list) else first_val.shape[0]
+        perm = rng.permutation(length)
 
-            out_dict = {}
-            for k, v in result.items():
-                if isinstance(v, list):
-                    if len(v) != length:
-                        raise ValueError(
-                            f"Dict outputs differ in length for key '{k}'")
-                    out_dict[k] = [v[i] for i in perm]
-                elif isinstance(v, np.ndarray):
-                    if v.shape[0] != length:
-                        raise ValueError(
-                            f"Dict outputs differ in length for key '{k}'")
-                    out_dict[k] = v[perm]
-                else:
+        out_dict: dict[str, Union[list, np.ndarray]] = {}
+        for k, v in result.items():
+            if isinstance(v, list):
+                if len(v) != length:
                     raise ValueError(
-                        "Unsupported type for multi-output shuffle.")
-            return out_dict
-        else:
-            rng.shuffle(result)
-            return result
-
-    def _assign_extracted(self, feat_name: str, result: Any, ext: Extractor) -> None:
-        """
-        Store raw_result in self.features[feat_name] (within a LazyFeature).
-        Also handle index creation/sharing logic.
-        """
-        dep_idx = self.indexes[ext.deps[0]] if ext.deps else None
-        if (ext.type == ExtractorType.FLAT_MAPPER
-            or ext.type == ExtractorType.BATCH_FLAT_MAPPER
-                or ext.shuffle):
-            # new index
-            length = self._determine_length(result)
-            new_idx = np.arange(length)
-            self.indexes[feat_name] = new_idx
-        else:
-            # share the dependency's index
-            if dep_idx is None:
+                        f"Dict outputs differ in length for key '{k}'")
+                out_dict[k] = [v[i] for i in perm]
+            elif isinstance(v, np.ndarray):
+                if v.shape[0] != length:
+                    raise ValueError(
+                        f"Dict outputs differ in length for key '{k}'")
+                out_dict[k] = v[perm]
+            else:
                 raise ValueError(
-                    f"No dependencies for {feat_name}, but not a flat mapper? Unexpected.")
-            self.indexes[feat_name] = dep_idx
-
-        # Wrap in LazyFeature
-        lf = LazyFeature(data=result)
-        self.features[feat_name] = lf
-
-    def _has_nonempty_data(self, feat_name: str) -> bool:
-        """
-        True if the feature is in self.features and has > 0 length in memory or on disk.
-        """
-        if feat_name not in self.features:
-            return False
-        lf = self.features[feat_name]
-        return lf.size() > 0
-
-    @staticmethod
-    def _determine_length(raw_result: Any) -> int:
-        """
-        Figure out how many "rows" are in raw_result.
-        """
-        if isinstance(raw_result, np.ndarray):
-            return raw_result.shape[0]
-        if isinstance(raw_result, list):
-            return len(raw_result)
-        # single scalar => length 1
-        return 1
+                    "Unsupported type for shuffle.")
+        return out_dict
 
     def _initialize_feature(self, feat_name: str, feat_value: Any) -> None:
         """
-        Store the initial features in the pipeline as a LazyFeature.
-        If it's a list, keep as list; if it's an array/scalar, treat as uniform if possible.
-        Also create the index array accordingly.
+        Store the initial features in the pipeline as a LazyFeature and create corresponding tables.
         """
-        if isinstance(feat_value, list):
-            # store as-is
-            lf = LazyFeature(feat_value)
-            self.features[feat_name] = lf
-            self.indexes[feat_name] = np.arange(len(feat_value))
-        else:
-            # single np.ndarray or scalar
-            if isinstance(feat_value, np.ndarray) and feat_value.ndim > 0:
-                # treat as uniform array
-                lf = LazyFeature(feat_value)
-                self.features[feat_name] = lf
-                # index is shape[0], or if 1D => shape[0], else shape[0]
-                self.indexes[feat_name] = np.arange(feat_value.shape[0])
-            else:
-                # scalar or zero-dim
-                lf = LazyFeature([feat_value])
-                self.features[feat_name] = lf
-                self.indexes[feat_name] = np.arange(1)
-
+        lf = LazyFeature(feat_value)
+        self.features[feat_name] = lf
+        self.tables[feat_name] = Table()
     # endregion
 
     # region: Pandas / Numpy interface
@@ -817,11 +654,11 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
             return np.array([])
 
         # Check index references
-        first_idx = self.indexes[feature_names[0]]
+        first_tlb = self.tables[feature_names[0]]
         for fn in feature_names[1:]:
-            if self.indexes[fn] is not first_idx:
+            if self.tables[fn] != first_tlb:
                 raise ValueError(
-                    "All requested features must share the same index object for `.numpy()`.")
+                    "All requested features must share the same table object for `.numpy()`.")
 
         arrays = []
         for fn in feature_names:
@@ -883,4 +720,4 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
     # endregion
 
 
-__all__ = [DAGXtractor, mapper, flat_mapper]
+__all__ = ["DAGXtractor", "mapper", "flat_mapper"]
