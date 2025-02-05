@@ -171,13 +171,15 @@ def flat_mapper(
 class Table:
     id: uuid.UUID
     parent_index_mapping: Optional[str]
-    def __init__(self, parent_index_mapping=None):
+
+    def __post_init__(self, parent_index_mapping=None):
         self.parent_index_mapping = parent_index_mapping
         self.id = uuid.uuid4()
 
 # ------------------------------------------------------------------
 #  Metaclass for DAGXtractor
 # ------------------------------------------------------------------
+
 
 class DAGXtractorMeta(type):
     """
@@ -445,8 +447,8 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
 
         outputs, table = self._run_extractor(ext)
         # There will be features and possibly newly created parent mappings.
-        for k, v in outputs.items(): 
-            self.features[k] = v
+        for k, v in outputs.items():
+            self.features[k] = LazyFeature(data=v)
             self.tables[k] = table
 
     @staticmethod
@@ -466,43 +468,40 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
         must_plain_loop = (not ext.uniform) or any(
             not is_numba_compatible(dep) for dep in dependencies)
 
-        def plain_python_wrapper():
+        def plain_python_wrapper(*args):
             """
             Applies 'method' sample-by-sample in pure Python, returning either
             a list of results or a dict of lists of results (if multi_output).
             """
-            n = len(dependencies[0])
+            n = len(args[0])
 
             if ext.multi_output:
-                first_out = ext.method(*_build_sample_args(0))
+                first_out = ext.method(*[arg[0] for arg in args])
                 if not isinstance(first_out, dict):
                     raise ValueError(
                         "method is expected to return a dict when multi_output=True")
                 out_dict = {
-                    k: np.empty((n,) + first_out.shape) if ext.uniform else [None] * n for k in first_out.keys()
+                    k: np.empty((n,) if np.isscalar(first_out) else (n,) + v.shape, dtype=np.result_type(v)) 
+                        if ext.uniform else [None] * n for k, v in first_out.items()
                 }
                 for i in range(1, n):
-                    result = ext.method(*_build_sample_args(i))
+                    result = ext.method(*[arg[i] for arg in args])
                     for k in result.keys():
                         out_dict[k][i] = result[k]
                 return out_dict
             else:
                 # Single output
-                first_out = ext.method(*_build_sample_args(0))
-                results = [first_out]
+                first_out = ext.method(*[arg[0] for arg in args])
+                results = np.empty((n,) if np.isscalar(first_out) else (n,) + first_out.shape, dtype=np.result_type(first_out)) \
+                    if ext.uniform else [None] * n
+                results[0] = first_out
                 for i in range(1, n):
-                    results.append(ext.method(*_build_sample_args(i)))
+                    results[i] = ext.method(*[arg[i] for arg in args])
                 return results
-
-        def _build_sample_args(i):
-            """
-            Build the list of arguments for method(...), taking the i-th sample (axis=0).
-            """
-            return [dep[i] for dep in dependencies]
 
         if must_plain_loop:
             return plain_python_wrapper
-        return nb.jit(nopython=True)(plain_python_wrapper)
+        return plain_python_wrapper  # TODO: Use guvectorize here
 
     @staticmethod
     def create_vectorized_flat_mapper(ext: Extractor, dependencies: list[Any]):
@@ -550,15 +549,10 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
                     results = sum(results)
                 return results
 
-        def _build_sample_args(i):
-            """
-            Build the list of arguments for method(...), taking the i-th sample (axis=0).
-            """
-            return [dep[i] for dep in dependencies]
-
         return plain_python_wrapper
 
     def _run_extractor(self, ext: Extractor) -> tuple[dict[str, Any], Table]:
+        print(f"Running extractor for features:", ','.join(ext.feature_names))
         # Load dependency data
         dep_data = []
         for d in ext.deps:
@@ -595,17 +589,20 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
             result = {
                 ext.feature_names[0]: result
             }
-        
+
         index_column_name = f"__index_{ext.feature_names[0]}"
         if ext.type == ExtractorType.FLAT_MAPPER or ext.type == ExtractorType.BATCH_FLAT_MAPPER:
             result[index_column_name] = index
-        
+
         if ext.shuffle:
             if index_column_name not in result:
-                result[index_column_name] = np.arange(len(result[next(iter(result.keys()))]))
-            rng = np.random.default_rng(seed = self._seed ^ hash(ext.feature_names[0]))
+                result[index_column_name] = np.arange(
+                    len(result[next(iter(result.keys()))]))
+            rng = np.random.default_rng(
+                seed=self._seed ^ hash(ext.feature_names[0]))
             self._shuffle_result(result, rng)
-        table = self.tables[ext.deps[0]] if index_column_name not in result else Table(index_column_name)
+        table = self.tables[ext.deps[0]] if index_column_name not in result else Table(
+            index_column_name)
         return result, table
 
     @staticmethod
