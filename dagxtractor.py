@@ -4,63 +4,158 @@ import numba as nb
 import pandas as pd
 import os
 import uuid
+import pickle
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
+from datetime import datetime
+from collections import deque
 from typing import (
     Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, Type, TypeVar
 )
 
+# Looks like my laptop is using swap file as crazy. 
+# Select the value to be about page size, really do not want 
+# to go over that value.
+MAX_BATCH_SZ_BYTES = 4096
+
+
+def is_jupyter() -> bool:
+    try:
+        shell = get_ipython().__class__.__name__
+        return shell == 'ZMQInteractiveShell'
+    except NameError:
+        return False
+
+
+if is_jupyter():
+    from tqdm.notebook import tqdm
+else:
+    from tqdm import tqdm
+
 # ------------------------------------------------------------------
 #  LazyFeature: holds data in memory or a path on disk
 # ------------------------------------------------------------------
+class MemoryManager:
+    def __init__(self, max_mem=10 * 1024 * 1024 * 1024):
+        self._q = deque()
+        self._max_mem=max_mem
+        self._used_mem = 0
+    def up(self, element: Tuple[LazyFeature, int, int]):
+        # Ups element in LRU cache
+        if element in self._q:
+            self._q.remove(element)  # Remove from current position
+        else:
+            self._used_mem += element[2]
+        self._q.append(element)      # Add to end (most recently used)
+    def cleanup(self):
+        # Dumps element to disk. Element is tuple (lazy_feature, batch_index, batch_size in bytes) 
+        while self._used_mem > self._max_mem and len(self._q) > 0:
+            # Get the least recently used element
+            lf, batch_idx, batch_sz = self._q.popleft()
+            # Dump it to disk
+            lf.dump_batch(batch_idx)
+            # Update memory usage
+            self._used_mem -= batch_sz
 
-TData = Union[np.ndarray, List[Any]]  # Simplified data type for demonstration
+class LazyFeatureIterator:
+    def __init__(self, lazy_feature: LazyFeature):
+        self._lazy_feature = lazy_feature
+        self._current_batch = -1
 
+    def __next__(self):
+        self._current_batch += 1
+        if self._current_batch >= len(self._lazy_feature._data):
+            raise StopIteration
+            
+        batch_idx = self._current_batch
+        
+        if self._lazy_feature._data[batch_idx] is None:
+            self._lazy_feature.load_batch(batch_idx)
+        
+        batch = self._lazy_feature._data[batch_idx]
+        batch_sz_bytes = batch.nbytes if isinstance(batch, np.array) else self._lazy_feature._batch_sz_bytes
+        self._lazy_feature._memory_manager.up((self._lazy_feature, batch_idx, batch_sz_bytes))
+        self._lazy_feature._memory_manager.cleanup()
+        
+        return batch
 
 class LazyFeature:
     """
     Wraps a feature's data, allowing it to be dumped to disk and reloaded on demand.
     """
 
-    def __init__(self, data: Optional[TData] = None, path: Optional[str] = None):
+    def __init__(self, memory_manager: MemoryManager, data: list[Any], batch_size: int, path: str, batch_sz_bytes=1024):
+        """
+        If batch_size > 1, data must be a list of np.ndarrays of shape
+        [b, ...], where b = batch_size for all items except maybe the last which may be smaller.
+        Path must be set and will be used for dumping when nessesary.
+        """
+        self._memory_manager = memory_manager
         self._data = data
-        self._path = path  # if data is dumped to disk
-        # If _data is not None, we assume it's loaded in memory
-
-    def is_loaded(self) -> bool:
-        return self._data is not None
-
-    def get(self) -> TData:
-        """
-        Return the in-memory data, loading from disk if necessary.
-        """
-        if self._data is None:
-            if self._path is None:
-                raise ValueError(
-                    "LazyFeature has no data or path. Nothing to load.")
-            # Load from disk
-            self._data = np.load(f"{self._path}.npy", allow_pickle=True)
-        return self._data
-
-    def dump(self, path: str) -> None:
-        """
-        Save the current data to disk (using np.save) and clear it from memory.
-        """
-        if self._data is None:
-            # Already unloaded or never existed
-            return
-        np.save(path, self._data, allow_pickle=True)
-        self._data = None
+        self._batch_size = batch_size
         self._path = path
+        self._batch_sz_bytes = batch_sz_bytes
+        for i in len(self._data):
+            batch_sz_bytes_calc = self._data[i].nbytes if isinstance(self._data[i], np.ndarray) else batch_sz_bytes
+            self._memory_manager.up((self, i, batch_sz_bytes_calc))
 
-    def set(self, data: TData) -> None:
-        """
-        Overwrite the feature data in memory; if there was a path, it is still valid
-        but we now consider it out of date if data changed. (For simplicity, we won't re-dump automatically.)
-        """
-        self._data = data
+    @staticmethod
+    def from_numpy(memory_manager: MemoryManager, arr: np.ndarray, path: str) -> LazyFeature:
+        # Determine the size of the batch, using array.nbytes for first element
+        # and MAX_BATCH_SZ_BYTES, split data accordingly and initialize in-memory lazy feature
+        batch_nbytes = arr[0].nbytes if len(arr) > 0 else MAX_BATCH_SZ_BYTES
+        batch_size = max(1, MAX_BATCH_SZ_BYTES // batch_nbytes)
+        
+        # Split array into batches
+        batches = np.array_split(arr, (arr.shape[0] + batch_size - 1) // batch_size, axis=0)
+        
+        # Create LazyFeature with batches
+        return LazyFeature(
+            memory_manager=memory_manager,
+            data=batches,
+            batch_size=batch_size,
+            path=path,
+            batch_sz_bytes=batch_nbytes * batch_size
+        )
 
+    @property
+    def batched(self) -> bool:
+        return self._batch_size > 1
+
+    def dump_batch(self, i: int):
+        if self._data[i] is None:
+            return
+        print("Dumping:", self.path, "batch:", i)
+        batch_data = self._data[i]
+        batch_path = os.path.join(self._path, f"batch_{i}")
+        if isinstance(batch_data, np.ndarray):
+            np.save(batch_path + ".npy", batch_data)
+        else:
+            with open(batch_path + ".pkl", "wb") as f:
+                pickle.dump(batch_data, f)
+        self._data[i] = None
+
+    def load_batch(self, i: int):
+        print("Loading:", self.path, "batch:", i)
+        batch_path = os.path.join(self._path, f"batch_{i}")
+        if os.path.exists(batch_path + ".npy"):
+            self._data[i] = np.load(batch_path + ".npy")
+        elif os.path.exists(batch_path + ".pkl"):
+            with open(batch_path + ".pkl", "rb") as f:
+                self._data[i] = pickle.load(f)
+        else:
+            raise FileNotFoundError(f"Batch file for index {i} not found.")
+
+    def dump_all(self) -> None:
+        for i in range(len(self._data)):
+            self.dump_batch(i)
+    
+    def __iter__(self) -> LazyFeatureIterator:
+        return LazyFeatureIterator(self)
+    
+    def __len__(self) -> int:
+        return len(self._data)
 
 # ------------------------------------------------------------------
 #  Extractor-related
@@ -167,14 +262,13 @@ def flat_mapper(
 # ------------------------------------------------------------------
 
 
-@dataclass(init=False, frozen=True)
+@dataclass(frozen=True)
 class Table:
-    id: uuid.UUID
-    parent_index_mapping: Optional[str]
+    id: uuid.UUID = field(init=False)
+    parent_index_mapping: Optional[str] = None
 
-    def __post_init__(self, parent_index_mapping=None):
-        self.parent_index_mapping = parent_index_mapping
-        self.id = uuid.uuid4()
+    def __post_init__(self):
+        object.__setattr__(self, 'id', uuid.uuid4())
 
 # ------------------------------------------------------------------
 #  Metaclass for DAGXtractor
@@ -481,8 +575,9 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
                     raise ValueError(
                         "method is expected to return a dict when multi_output=True")
                 out_dict = {
-                    k: np.empty((n,) if np.isscalar(first_out) else (n,) + v.shape, dtype=np.result_type(v)) 
-                        if ext.uniform else [None] * n for k, v in first_out.items()
+                    k: np.empty((n,) if np.isscalar(first_out) else (
+                        n,) + v.shape, dtype=np.result_type(v), order='C')
+                    if ext.uniform else [None] * n for k, v in first_out.items()
                 }
                 for i in range(1, n):
                     result = ext.method(*[arg[i] for arg in args])
@@ -492,10 +587,10 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
             else:
                 # Single output
                 first_out = ext.method(*[arg[0] for arg in args])
-                results = np.empty((n,) if np.isscalar(first_out) else (n,) + first_out.shape, dtype=np.result_type(first_out)) \
-                    if ext.uniform else [None] * n
+                results = np.empty((n,) if np.isscalar(first_out) else (
+                    n,) + first_out.shape, dtype=np.result_type(first_out), order='C') if ext.uniform else [None] * n
                 results[0] = first_out
-                for i in range(1, n):
+                for i in tqdm(range(1, n), desc=ext.feature_names[0], total=n-1):
                     results[i] = ext.method(*[arg[i] for arg in args])
                 return results
 
@@ -552,7 +647,6 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
         return plain_python_wrapper
 
     def _run_extractor(self, ext: Extractor) -> tuple[dict[str, Any], Table]:
-        print(f"Running extractor for features:", ','.join(ext.feature_names))
         # Load dependency data
         dep_data = []
         for d in ext.deps:
@@ -572,12 +666,18 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
         else:
             raise NotImplementedError()
 
+        start = datetime.now()
+        print(f"Running extractor for features",
+              ', '.join(ext.feature_names), "at", start)
         try:
             result = batched_method(*dep_data)
         except Exception as e:
             raise RuntimeError(
                 f"Extractor '{ext.feature_names}' failed."
             ) from e
+        end = datetime.now()
+        print(f"Done running extractor", "at", end,
+              "total running time", end - start)
 
         if ext.type == ExtractorType.FLAT_MAPPER or ext.type == ExtractorType.BATCH_FLAT_MAPPER:
             result, index_borders = result
@@ -589,6 +689,8 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
             result = {
                 ext.feature_names[0]: result
             }
+        for k in result.keys():
+            result[k] = np.ascontiguousarray(result[k])
 
         index_column_name = f"__index_{ext.feature_names[0]}"
         if ext.type == ExtractorType.FLAT_MAPPER or ext.type == ExtractorType.BATCH_FLAT_MAPPER:
