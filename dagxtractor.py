@@ -1,6 +1,5 @@
 import inspect
 import numpy as np
-import numba as nb
 import pandas as pd
 import os
 import uuid
@@ -15,9 +14,7 @@ from typing import (
     Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, Type, TypeVar, Self
 )
 
-# Looks like my laptop is using swap file as crazy.
-# Select the value to be about page size, really do not want
-# to go over that value.
+
 MAX_BATCH_SZ_BYTES = 4096
 DEFAULT_SCALAR_SIZE = 8
 
@@ -660,7 +657,7 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
                 dep_batch_slices[i] = dep_batches[i][
                     batch_start % dep_batch_size: batch_start % dep_batch_size + min_batch_size]
 
-            # Store results in outputs
+            # Allocate batches if needed and store corresponding slices
             for i, fname in enumerate(ext.feature_names):
                 if batch_start % output_batch_sizes[i] == 0:
                     if output_batches[i] is not None:
@@ -681,6 +678,56 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
         self._memory_manager.cleanup()
         return outputs
 
+    def _run_nonuniform_mapper(self, ext: Extractor):
+        """
+        Run non-uniform mapper extractor on dependencies stored in self.features.
+        No batching is used, as each output sample may have different size.
+        Returns outputs dictionary mapping feature names to computed arrays.
+        """
+
+        assert ext.type == ExtractorType.MAPPER
+        assert not ext.uniform
+
+        dep_batches = [] # Current batches of each dependency.
+        dep_batch_slices = [] # Slices of current batches for each feature which we feed to mapper.
+        dep_iters = [] # Iterators for each dependency.
+        dep_batch_sizes = [] # Batch sizes for each dependency.
+        for dep_name in ext.deps:
+            if dep_name not in self.features:
+                raise ValueError(
+                    f"Dependency '{dep_name}' not found in self.features")
+            dep_iter = iter(self.features[dep_name])
+            first_batch = next(dep_iter)
+            dep_batches.append(first_batch)
+            dep_batch_slices.append(None)
+            dep_iters.append(iter(self.features[dep_name]))
+            dep_batch_sizes.append(self.features[dep_name]._batch_size)
+
+        # Create output lazy features
+        outputs: Dict[str, LazyFeature] = {}
+        for i, fname in enumerate(ext.feature_names):
+            outputs[fname] = LazyFeature(self._memory_manager, [], 1, os.path.join(self._path, fname))
+
+        # Process data in batches
+        n_samples = self.features[ext.deps[0]].len_samples
+        for batch_start in tqdm(range(0, n_samples), total=n_samples):
+            # Get current batch from each dependency only when needed
+            for i, dep_name in enumerate(ext.deps):
+                if batch_start % dep_batch_sizes[i] == 0:
+                    # Need to advance this iterator
+                    dep_batches[i] = next(dep_iters[i])
+                dep_batch_size = dep_batch_sizes[i]
+                dep_batch_slices[i] = dep_batches[i][batch_start % dep_batch_size]
+
+            result = ext.method(*dep_batch_slices)
+            if not ext.multi_output:
+                result = (result,)
+            for i, fname in enumerate(ext.feature_names):
+                outputs[fname].append_batch(np.array(result[i])[None, ...])
+            # Clean up memory after each batch
+            self._memory_manager.cleanup()
+        return outputs      
+    
     @staticmethod
     def create_vectorized_flat_mapper(ext: Extractor, dependencies: list[Any]):
         """
@@ -736,7 +783,10 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
         print(f"Running extractor for features",
               ', '.join(ext.feature_names), "at", start)
         if ext.type == ExtractorType.BATCH_MAPPER or ext.type == ExtractorType.MAPPER:
-            results = self._run_mapper(ext)
+            if ext.uniform:
+                results = self._run_mapper(ext)
+            else:
+                results = self._run_nonuniform_mapper(ext)
         elif ext.type == ExtractorType.FLAT_MAPPER or ext.type == ExtractorType.BATCH_FLAT_MAPPER:
             raise NotImplementedError(
                 "It's hard to auto vectorize flat mappers as we don't know resulting shape")
