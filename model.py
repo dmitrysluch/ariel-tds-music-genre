@@ -24,6 +24,9 @@ def train_and_evaluate_catboost(
     - mean_accuracy: Mean accuracy across the 5 folds
     """
 
+    kwargs.setdefault("learning_rate", 0.1)
+    kwargs.setdefault("depth", 3)
+    
     # Set up stratified 5-fold cross-validation
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
@@ -38,9 +41,7 @@ def train_and_evaluate_catboost(
 
         # Initialize CatBoostClassifier
         model = CatBoostClassifier(
-            iterations=500,          
-            learning_rate=0.1,       
-            depth=3,                 
+            iterations=500,                           
             loss_function='MultiClass',  
             eval_metric='Accuracy',  
             random_seed=42,
@@ -74,9 +75,7 @@ def train_and_evaluate_catboost(
     # (Optional) Train a final model on the entire dataset
     # so you have a ready-to-use classifier after cross-validation
     final_model = CatBoostClassifier(
-        iterations=500,          
-        learning_rate=0.1,       
-        depth=3,                 
+        iterations=500,                           
         loss_function='MultiClass',  
         eval_metric='Accuracy',  
         verbose=100 if verbose else False,
