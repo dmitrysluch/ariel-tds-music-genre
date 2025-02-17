@@ -15,8 +15,9 @@ from typing import (
 )
 
 
-MAX_BATCH_SZ_BYTES = 4096
+MAX_BATCH_SZ_BYTES = 4 * 1024 * 1024 # 4Mb
 DEFAULT_SCALAR_SIZE = 8
+PARENT_INDEX_MAPPING_COLUMN = "__parent_index_mapping__{}"
 
 
 def is_jupyter() -> bool:
@@ -120,8 +121,7 @@ class LazyFeature:
 
         # Split array into batches
         batches = np.array_split(
-            arr, (arr.shape[0] + batch_size - 1) // batch_size, axis=0)
-
+            arr, np.arange(batch_size, arr.shape[0], batch_size), axis=0)
         # Create LazyFeature with batches
         return LazyFeature(
             memory_manager=memory_manager,
@@ -411,8 +411,13 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
         if batched and not uniform:
             raise ValueError(
                 "Batching only supported for uniform flatmappers.")
+        
+        if batched:
+            raise NotImplementedError(
+                "Batched flat mappers aren't supported yet"
+            )
 
-        ext_type = ExtractorType.BATCH_FLAT_MAPPER if batched else ExtractorType.FLAT_MAPPER
+        ext_type = ExtractorType.FLAT_MAPPER
         ext = Extractor(
             feature_names=f_names,
             method=method,
@@ -579,6 +584,10 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
         Run mapper extractor on dependencies stored in self.features.
         Returns outputs dictionary mapping feature names to computed arrays.
         """
+
+        assert ext.type == ExtractorType.MAPPER or ext.type == ExtractorType.BATCH_MAPPER
+        assert ext.uniform
+
         dep_batches = [] # Current batches of each dependency.
         dep_batch_slices = [] # Slices of current batches for each feature which we feed to mapper.
         dep_iters = [] # Iterators for each dependency.
@@ -593,7 +602,9 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
             dep_batch_slices.append(None)
             dep_iters.append(iter(self.features[dep_name]))
             dep_batch_sizes.append(self.features[dep_name]._batch_size)
+
         # Run for first sample to get output shape/type
+        # TODO: do not run extractor on that sample again.
         if ext.type == ExtractorType.MAPPER:
             example_deps = [dep[0] for dep in dep_batches]
             example_outputs = ext.method(*example_deps)
@@ -727,54 +738,112 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
             # Clean up memory after each batch
             self._memory_manager.cleanup()
         return outputs      
+
+    def _run_flatmapper(self, ext: Extractor):
+        """
+        Run flatmapper extractor on dependencies stored in self.features.
+        No batching is used, as each output sample may have different size.
+        Returns outputs dictionary mapping feature names to computed arrays.
+        """
+
+        assert ext.type == ExtractorType.FLAT_MAPPER
+        assert ext.uniform
+
+        dep_batches = [] # Current batches of each dependency.
+        dep_batch_slices = [] # Slices of current batches for each feature which we feed to mapper.
+        dep_iters = [] # Iterators for each dependency.
+        dep_batch_sizes = [] # Batch sizes for each dependency.
+        for dep_name in ext.deps:
+            if dep_name not in self.features:
+                raise ValueError(
+                    f"Dependency '{dep_name}' not found in self.features")
+            dep_iter = iter(self.features[dep_name])
+            first_batch = next(dep_iter)
+            dep_batches.append(first_batch)
+            dep_batch_slices.append(None)
+            dep_iters.append(iter(self.features[dep_name]))
+            dep_batch_sizes.append(self.features[dep_name]._batch_size)
+
+        # Run for first sample to get output shape/type
+        # TODO: do not run extractor on that sample again.
+        example_deps = [dep[0] for dep in dep_batches]
+        example_outputs = next(iter(ext.method(*example_deps)))
+        if not ext.multi_output:
+            example_outputs = (np.array(example_outputs, copy=False),)
+        else:
+            example_outputs = tuple(np.array(x, copy=False) for x in example_outputs)
+
+        example_outputs = example_outputs + (np.array(0),)
+
+        # Calculate batch sizes based on output size
+        if not isinstance(example_outputs, tuple):
+            raise ValueError("Multi-output mapper must return tuple")
+        output_byte_sizes = tuple(v.nbytes if isinstance(v, np.ndarray) else DEFAULT_SCALAR_SIZE for v in example_outputs)
+        output_batch_sizes = tuple(
+            max(1, 2**int(np.log2(MAX_BATCH_SZ_BYTES / sz))) for sz in output_byte_sizes)
+
+        # Create output lazy features
+        outputs = {}
+        for i, fname in enumerate(ext.feature_names + [PARENT_INDEX_MAPPING_COLUMN.format(ext.feature_names[0])]):
+            outputs[fname] = LazyFeature(self._memory_manager, [], output_batch_sizes[i], os.path.join(self._path, fname))
+
+        batched_method = vectorize.create_vectorized_flatmapper(
+            ext.method, example_deps, example_outputs, multi=ext.multi_output)
+
+        # Process data in batches
+        n_samples = self.features[ext.deps[0]].len_samples
+        min_dep_batch_size = min(dep_batch_sizes)
+        min_output_batch_size = min(output_batch_sizes)
+        output_batches = [None] * (len(ext.feature_names) + 1)
+        output_batch_slices = [None] * (len(ext.feature_names) + 1)
+        output_batch_start = 0
+        dont_create_batch = False  # hack to handle generator not writing anything
+        for batch_start in tqdm(range(0, n_samples, min_dep_batch_size), 
+                                total=(n_samples + min_dep_batch_size - 1) // min_dep_batch_size):
+            # Get current batch from each dependency only when needed
+            for i, dep_name in enumerate(ext.deps):
+                if batch_start % dep_batch_sizes[i] == 0:
+                    # Need to advance this iterator
+                    dep_batches[i] = next(dep_iters[i])
+                dep_batch_size = dep_batch_sizes[i]
+                dep_batch_slices[i] = dep_batches[i][
+                    batch_start % dep_batch_size: batch_start % dep_batch_size + min_dep_batch_size]
+
+            gen = batched_method(*dep_batch_slices, base=batch_start)
+            gen.send(None)
+
+            while True:
+                # Allocate batches if needed and store corresponding slices
+                for i, fname in enumerate(ext.feature_names + [PARENT_INDEX_MAPPING_COLUMN.format(ext.feature_names[0])]):
+                    if output_batch_start % output_batch_sizes[i] == 0 and not dont_create_batch:
+                        if output_batches[i] is not None:
+                            outputs[fname].append_batch(output_batches[i])
+                        output_batch_size = output_batch_sizes[i]
+                        output_batches[i] = np.empty(
+                            (output_batch_size,) + example_outputs[i].shape, dtype=example_outputs[i].dtype)
     
-    @staticmethod
-    def create_vectorized_flat_mapper(ext: Extractor, dependencies: list[Any]):
-        """
-        Creates a function that flap maps `ext.method` along axis=0 of the given dependencies.
-        """
+                    start_idx = output_batch_start % output_batch_sizes[i]
+                    end_idx = ((output_batch_start // min_output_batch_size) * min_output_batch_size) % \
+                        output_batch_sizes[i]  + min_output_batch_size
+                    output_batch_slices[i] = output_batches[i][start_idx:end_idx]
+                
+                try:
+                    sz = gen.send(output_batch_slices)
+                    output_batch_start += sz
+                    dont_create_batch = sz == 0
+                except StopIteration as e:
+                    sz = e.value
+                    output_batch_start += sz
+                    dont_create_batch = sz == 0
+                    break
 
-        def plain_python_wrapper():
-            """
-            Applies 'method' sample-by-sample in pure Python, returning either
-            a list of results or a dict of lists of results (if multi_output).
-            """
-            n = len(dependencies[0])
-            index = []
-            curr_index = 0
-            if ext.multi_output:
-                first_out = ext.method(*_build_sample_args(0))
-                if not isinstance(first_out, dict):
-                    raise ValueError(
-                        "method is expected to return a dict when multi_output=True")
-                out_dict = {k: [] for k in first_out.keys()}
-                for i in range(1, n):
-                    result = ext.method(*_build_sample_args(i))
-                    for k in result.keys():
-                        out_dict[k].append(result[k])
-                curr_index += out_dict[iter(next(out_dict.keys()))].shape[0]
-                index.append(curr_index)
-                for k in result.keys():
-                    if ext.uniform:
-                        out_dict[k] = np.stack(out_dict[k], axis=0)
-                    else:
-                        out_dict[k] = sum(out_dict[k])
-                return out_dict
-            else:
-                # Single output
-                first_out = ext.method(*_build_sample_args(0))
-                results = [first_out]
-                for i in range(1, n):
-                    results.append(ext.method(*_build_sample_args(i)))
-                    curr_index += results[-1].shape[0]
-                    index.append(curr_index)
-                if ext.uniform:
-                    results = np.stack(results, axis=0)
-                else:
-                    results = sum(results)
-                return results
-
-        return plain_python_wrapper
+            
+            # Clean up memory after each batch
+            self._memory_manager.cleanup()
+        for i, f_name in enumerate(ext.feature_names + [PARENT_INDEX_MAPPING_COLUMN.format(ext.feature_names[0])]):
+            outputs[f_name].append_batch(output_batches[i][:output_batch_start % output_batch_sizes[i]])
+        self._memory_manager.cleanup()
+        return outputs 
 
     def _run_extractor(self, ext: Extractor) -> tuple[dict[str, Any], Table]:
         # Load dependency data
@@ -787,65 +856,27 @@ class DAGXtractor(metaclass=DAGXtractorMeta):
                 results = self._run_mapper(ext)
             else:
                 results = self._run_nonuniform_mapper(ext)
-        elif ext.type == ExtractorType.FLAT_MAPPER or ext.type == ExtractorType.BATCH_FLAT_MAPPER:
-            raise NotImplementedError(
-                "It's hard to auto vectorize flat mappers as we don't know resulting shape")
+        elif ext.type == ExtractorType.FLAT_MAPPER:
+            if ext.uniform:
+                results = self._run_flatmapper(ext)
+            else:
+                raise NotImplementedError("Non-uniform flat mappers not supported yet.")
         else:
             raise NotImplementedError()
         end = datetime.now()
         print(f"Done running extractor", "at", end,
               "total running time", end - start)
 
-        if ext.type == ExtractorType.FLAT_MAPPER or ext.type == ExtractorType.BATCH_FLAT_MAPPER:
-            raise NotImplementedError
-            result, index_borders = result
-            index = np.zeros((index_borders[-1],))
-            index[index_borders[:-1]] = 1
-            index = np.cumsum(index)
-
-        index_column_name = f"__index_{ext.feature_names[0]}"
-        if ext.type == ExtractorType.FLAT_MAPPER or ext.type == ExtractorType.BATCH_FLAT_MAPPER:
-            results[index_column_name] = index
-
         if ext.shuffle:
-            # To shuffle elements on disk one needs to implement on-disk sort, and
-            # I really don't want to do it now. And probably it should be another extractor type
+            # To shuffle elements on disk one needs to implement external memory sort, and
+            # I really don't want to do it now. And probably it should be another extractor type.
             raise NotImplementedError(
-                "it's hard to shuffle when elements are on disk.")
-            if index_column_name not in result:
-                result[index_column_name] = np.arange(
-                    len(result[next(iter(result.keys()))]))
-            rng = np.random.default_rng(
-                seed=self._seed ^ hash(ext.feature_names[0]))
-            self._shuffle_result(result, rng)
+                "It's hard to shuffle when elements are on disk.")
+        
+        index_column_name = PARENT_INDEX_MAPPING_COLUMN.format(ext.feature_names[0])
         table = self.tables[ext.deps[0]] if index_column_name not in results else Table(
             index_column_name)
         return results, table
-
-    @staticmethod
-    def _shuffle_result(result: dict[str, Union[list, np.ndarray]], rng: np.random.Generator) -> dict | list | np.ndarray:
-        first_key = next(iter(result))
-        first_val = result[first_key]
-        length = len(first_val) if isinstance(
-            first_val, list) else first_val.shape[0]
-        perm = rng.permutation(length)
-
-        out_dict: dict[str, Union[list, np.ndarray]] = {}
-        for k, v in result.items():
-            if isinstance(v, list):
-                if len(v) != length:
-                    raise ValueError(
-                        f"Dict outputs differ in length for key '{k}'")
-                out_dict[k] = [v[i] for i in perm]
-            elif isinstance(v, np.ndarray):
-                if v.shape[0] != length:
-                    raise ValueError(
-                        f"Dict outputs differ in length for key '{k}'")
-                out_dict[k] = v[perm]
-            else:
-                raise ValueError(
-                    "Unsupported type for shuffle.")
-        return out_dict
 
     def _initialize_feature(self, feat_name: str, feat_value: Any) -> None:
         """

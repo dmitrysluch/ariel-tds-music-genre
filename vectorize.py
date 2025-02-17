@@ -212,3 +212,55 @@ def create_vectorized_mapper_multi(method, example_args, example_outs):
         
     
     return wrapper
+
+# It's hard to jit flatmappers as:
+# 1. We do not know output size
+# 2. Output may (and expected to) be arbitrary iterable (e.g. generator)
+# Maybe I'll implement them at some point.
+def create_vectorized_flatmapper(method, example_args, example_outs, multi=False):
+    """
+    method: A function that, given a single 'row' from each input array,
+            returns an iterable of output elements.
+
+    example_args: Example inputs (used for shape-checking or debugging if desired).
+    example_outs: Example outputs (used for shape-checking or debugging if desired).
+
+    Returns:
+        wrapper: A generator function that:
+            1) Expects a batch of output storage from the caller via `yield`.
+            2) Fills that batch from the iterators produced by `method`.
+            3) Requests fresh output batches via `yield` when the old one fills up.
+            4) Stops when all the input samples (the first dim of each *args) have been processed.
+    """
+    def wrapper(*args, base=0):
+        # Ensure all inputs have the same batch dimension
+        batch_size = args[0].shape[0]
+        # Get first output batch from caller
+        out_batch = yield
+        out_idx = 0  # index within out_batch
+        # Iterate over each "row" in the input batch
+        for i in range(batch_size):
+            # Extract row-slices to pass to method
+            row_args = [arr[i] for arr in args]
+            # Call method on this "row"
+            iterator = method(*row_args)
+
+            # Write items from the iterator into the output batch
+            for item in iterator:
+                if multi:
+                    for j in range(len(item)):
+                        out_batch[j][out_idx] = item[j]
+                else:
+                    out_batch[0][out_idx] = item
+                out_batch[-1][out_idx] = base + i  # index mapping
+                print(tuple(out_batch[i][out_idx] for i in range(len(out_batch))), file=open("debug.txt", "a"))
+                out_idx += 1
+                # If the output batch is full, request a fresh one
+                if out_idx >= len(out_batch[0]):
+                    out_batch = yield out_idx
+                    out_idx = 0
+
+        # Once all samples are processed, return (the generator completes)
+        return out_idx
+
+    return wrapper
